@@ -390,7 +390,7 @@ def test_merge_asof_left_on_right_index(
             assert_eq(c, C)
 
 
-def test_merge_asof_indexed():
+def test_merge_asof_indexed_two_partitions():
     A = pd.DataFrame({"left_val": ["a", "b", "c"]}, index=[1, 5, 10])
     a = dd.from_pandas(A, npartitions=2)
     B = pd.DataFrame({"right_val": [1, 2, 3, 6, 7]}, index=[1, 2, 3, 6, 7])
@@ -594,11 +594,11 @@ def test_indexed_concat(join):
     b = dd.repartition(B, [1, 2, 5, 8])
 
     expected = pd.concat([A, B], axis=0, join=join, sort=False)
-    result = concat_indexed_dataframes([a, b], join=join)
-    assert_eq(result, expected)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
+        result = concat_indexed_dataframes([a, b], join=join)
+        assert_eq(result, expected)
         assert sorted(concat_indexed_dataframes([a, b], join=join).dask) == sorted(
             concat_indexed_dataframes([a, b], join=join).dask
         )
@@ -626,10 +626,13 @@ def test_concat(join):
 
     kwargs = {"sort": False}
 
-    for (dd1, dd2, pd1, pd2) in [(ddf1, ddf2, pdf1, pdf2), (ddf1, ddf3, pdf1, pdf3)]:
+    for (dd1, dd2, pd1, pd2) in [
+        (ddf1, ddf2, pdf1, pdf2),
+        (ddf1, ddf3, pdf1, pdf3),
+    ]:
 
         expected = pd.concat([pd1, pd2], join=join, **kwargs)
-        result = dd.concat([dd1, dd2], join=join)
+        result = dd.concat([dd1, dd2], join=join, **kwargs)
         assert_eq(result, expected)
 
     # test outer only, inner has a problem on pandas side
@@ -642,7 +645,7 @@ def test_concat(join):
         (ddf1.x, ddf3.z, pdf1.x, pdf3.z),
     ]:
         expected = pd.concat([pd1, pd2], **kwargs)
-        result = dd.concat([dd1, dd2])
+        result = dd.concat([dd1, dd2], **kwargs)
         assert_eq(result, expected)
 
 
@@ -1901,7 +1904,7 @@ def test_append():
             warnings.simplefilter("ignore", FutureWarning)
             expected = pandas_obj.append(pandas_append)
 
-        result = dask_obj.append(dask_append)
+            result = dask_obj.append(dask_append)
 
         assert_eq(result, expected)
 
@@ -2138,3 +2141,86 @@ def test_groupby_concat_cudf(engine):
         res_dd = dd.concat([grouped_dd1, grouped_dd2], axis=1)
 
     assert_eq(res_dd.compute().sort_index(), res.sort_index())
+
+
+def test_categorical_join():
+    # https://github.com/dask/dask/issues/6134
+    df = pd.DataFrame(
+        {
+            "join_col": ["a", "a", "b", "b"],
+            "a": [0, 0, 10, 10],
+        }
+    )
+    df2 = pd.DataFrame({"b": [1, 2, 1, 2]}, index=["a", "a", "b", "b"])
+
+    ddf = dd.from_pandas(df, npartitions=2)
+    ddf2 = dd.from_pandas(df2, npartitions=1)
+    ddf["join_col"] = ddf["join_col"].astype("category")
+    ddf2.index = ddf2.index.astype("category")
+
+    expected = ddf.compute().join(ddf2.compute(), on="join_col", how="left")
+
+    actual_dask = ddf.join(ddf2, on="join_col", how="left")
+    assert actual_dask.join_col.dtype == "category"
+
+    actual = actual_dask.compute()
+    if dd._compat.PANDAS_GT_100:
+        assert actual.join_col.dtype == "category"
+        assert assert_eq(expected, actual)
+    else:
+        assert actual.join_col.dtype == "object"
+        assert (expected.values == actual.values).all()
+
+
+def test_categorical_merge_with_columns_missing_from_left():
+    df1 = pd.DataFrame({"A": [0, 1], "B": pd.Categorical(["a", "b"])})
+    df2 = pd.DataFrame({"C": pd.Categorical(["a", "b"])})
+
+    expected = pd.merge(df2, df1, left_index=True, right_on="A")
+
+    ddf1 = dd.from_pandas(df1, npartitions=2)
+    ddf2 = dd.from_pandas(df2, npartitions=2)
+
+    actual = dd.merge(ddf2, ddf1, left_index=True, right_on="A").compute()
+    assert actual.C.dtype == "category"
+    assert actual.B.dtype == "category"
+    assert actual.A.dtype == "int64"
+    assert actual.index.dtype == "int64"
+    assert assert_eq(expected, actual)
+
+
+@pytest.mark.skipif(not dd._compat.PANDAS_GT_0250, reason="Changes in categoricals")
+def test_categorical_merge_with_merge_column_cat_in_one_and_not_other_upcasts():
+    df1 = pd.DataFrame({"A": pd.Categorical([0, 1]), "B": pd.Categorical(["a", "b"])})
+    df2 = pd.DataFrame({"C": pd.Categorical(["a", "b"])})
+
+    expected = pd.merge(df2, df1, left_index=True, right_on="A")
+
+    ddf1 = dd.from_pandas(df1, npartitions=2)
+    ddf2 = dd.from_pandas(df2, npartitions=2)
+
+    actual = dd.merge(ddf2, ddf1, left_index=True, right_on="A").compute()
+    assert actual.C.dtype == "category"
+    assert actual.B.dtype == "category"
+    assert actual.A.dtype == "int64"
+    assert actual.index.dtype == "int64"
+    assert assert_eq(expected, actual)
+
+
+def test_categorical_merge_retains_category_dtype():
+    # https://github.com/dask/dask/issues/6142
+    a = pd.DataFrame({"A": [0, 1, 2, 3], "B": [4, 5, 6, 7]})
+    b = pd.DataFrame({"A": [0, 1, 2, 4], "C": [4, 5, 7, 7]})
+
+    df1 = dd.from_pandas(a, 2)
+    df1["A"] = df1.A.astype("category")
+
+    df2 = dd.from_pandas(b, 2)
+    df2["A"] = df2.A.astype("category")
+
+    actual_dask = df1.merge(df2, on="A")
+    assert actual_dask.A.dtype == "category"
+
+    if dd._compat.PANDAS_GT_100:
+        actual = actual_dask.compute()
+        assert actual.A.dtype == "category"

@@ -11,7 +11,7 @@ except ImportError:
 
 from .core import concatenate as _concatenate
 from .creation import arange as _arange
-from ..utils import derived_from
+from ..utils import derived_from, skip_doctest
 
 
 chunk_error = (
@@ -112,7 +112,7 @@ _out_chunk_fns = {
 
 
 def fft_wrap(fft_func, kind=None, dtype=None):
-    """ Wrap 1D, 2D, and ND real and complex FFT functions
+    """Wrap 1D, 2D, and ND real and complex FFT functions
 
     Takes a function that behaves like ``numpy.fft`` functions and
     a specified kind to match it to that are named after the functions
@@ -137,8 +137,9 @@ def fft_wrap(fft_func, kind=None, dtype=None):
 
     Examples
     --------
-    >>> parallel_fft = fft_wrap(np.fft.fft)
-    >>> parallel_ifft = fft_wrap(np.fft.ifft)
+    >>> import dask.array.fft as dff
+    >>> parallel_fft = dff.fft_wrap(np.fft.fft)
+    >>> parallel_ifft = dff.fft_wrap(np.fft.ifft)
     """
     if scipy is not None:
         if fft_func is scipy.fftpack.rfft:
@@ -210,6 +211,7 @@ def fft_wrap(fft_func, kind=None, dtype=None):
     if fft_func.__doc__ is not None:
         func.__doc__ = fft_preamble % (2 * (func_fullname,))
         func.__doc__ += fft_func.__doc__
+        func.__doc__ = skip_doctest(func.__doc__)
     func.__name__ = func_name
     return func
 

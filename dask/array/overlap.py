@@ -1,11 +1,20 @@
+import warnings
 from operator import getitem
 from itertools import product
 from numbers import Integral
-from tlz import merge, pipe, concat, partial
+from tlz import merge, pipe, concat, partial, get
 from tlz.curried import map
 
-from . import chunk, wrap
-from .core import Array, map_blocks, concatenate, concatenate3, reshapelist
+from . import chunk
+from .core import (
+    Array,
+    map_blocks,
+    concatenate,
+    concatenate3,
+    reshapelist,
+    unify_chunks,
+)
+from .creation import empty_like, full_like
 from ..highlevelgraph import HighLevelGraph
 from ..base import tokenize
 from ..core import flatten
@@ -53,7 +62,7 @@ def fractional_slice(task, axes):
 
 
 def expand_key(k, dims, name=None, axes=None):
-    """ Get all neighboring keys around center
+    """Get all neighboring keys around center
 
     Parameters
     ----------
@@ -108,7 +117,7 @@ def expand_key(k, dims, name=None, axes=None):
 
 
 def overlap_internal(x, axes):
-    """ Share boundaries between neighboring blocks
+    """Share boundaries between neighboring blocks
 
     Parameters
     ----------
@@ -189,7 +198,7 @@ def trim_overlap(x, depth, boundary=None):
 
 
 def trim_internal(x, axes, boundary=None):
-    """ Trim sides from each block
+    """Trim sides from each block
 
     This couples well with the overlap operation, which may leave excess data on
     each block
@@ -226,7 +235,11 @@ def trim_internal(x, axes, boundary=None):
     chunks = tuple(olist)
 
     return map_blocks(
-        partial(_trim, axes=axes, boundary=boundary), x, chunks=chunks, dtype=x.dtype
+        partial(_trim, axes=axes, boundary=boundary),
+        x,
+        chunks=chunks,
+        dtype=x.dtype,
+        meta=x._meta,
     )
 
 
@@ -267,7 +280,7 @@ def _trim(x, axes, boundary, block_info):
 
 
 def periodic(x, axis, depth):
-    """ Copy a slice of an array around to its other side
+    """Copy a slice of an array around to its other side
 
     Useful to create periodic boundary conditions for overlap
     """
@@ -291,7 +304,7 @@ def periodic(x, axis, depth):
 
 
 def reflect(x, axis, depth):
-    """ Reflect boundaries of array on the same side
+    """Reflect boundaries of array on the same side
 
     This is the converse of ``periodic``
     """
@@ -321,7 +334,7 @@ def reflect(x, axis, depth):
 
 
 def nearest(x, axis, depth):
-    """ Each reflect each boundary value outwards
+    """Each reflect each boundary value outwards
 
     This mimics what the skimage.filters.gaussian_filter(... mode="nearest")
     does.
@@ -350,18 +363,13 @@ def constant(x, axis, depth, value):
     chunks = list(x.chunks)
     chunks[axis] = (depth,)
 
-    try:
-        c = wrap.full_like(
-            getattr(x, "_meta", x),
-            value,
-            shape=tuple(map(sum, chunks)),
-            chunks=tuple(chunks),
-            dtype=x.dtype,
-        )
-    except TypeError:
-        c = wrap.full(
-            tuple(map(sum, chunks)), value, chunks=tuple(chunks), dtype=x.dtype
-        )
+    c = full_like(
+        x,
+        value,
+        shape=tuple(map(sum, chunks)),
+        chunks=tuple(chunks),
+        dtype=x.dtype,
+    )
 
     return concatenate([c, x, c], axis=axis)
 
@@ -378,7 +386,7 @@ def _remove_overlap_boundaries(l, r, axis, depth):
 
 
 def boundaries(x, depth=None, kind=None):
-    """ Add boundary conditions to an array before overlaping
+    """Add boundary conditions to an array before overlaping
 
     See Also
     --------
@@ -411,7 +419,7 @@ def boundaries(x, depth=None, kind=None):
 
 
 def overlap(x, depth, boundary):
-    """ Share boundaries between neighboring blocks
+    """Share boundaries between neighboring blocks
 
     Parameters
     ----------
@@ -505,15 +513,12 @@ def add_dummy_padding(x, depth, boundary):
             empty_chunks = list(x.chunks)
             empty_chunks[k] = (d,)
 
-            try:
-                empty = wrap.empty_like(
-                    getattr(x, "_meta", x),
-                    shape=empty_shape,
-                    chunks=empty_chunks,
-                    dtype=x.dtype,
-                )
-            except TypeError:
-                empty = wrap.empty(empty_shape, chunks=empty_chunks, dtype=x.dtype)
+            empty = empty_like(
+                getattr(x, "_meta", x),
+                shape=empty_shape,
+                chunks=empty_chunks,
+                dtype=x.dtype,
+            )
 
             out_chunks = list(x.chunks)
             ax_chunks = list(out_chunks[k])
@@ -526,30 +531,53 @@ def add_dummy_padding(x, depth, boundary):
     return x
 
 
-def map_overlap(x, func, depth, boundary=None, trim=True, **kwargs):
-    """ Map a function over blocks of the array with some overlap
+def map_overlap(
+    func, *args, depth=None, boundary=None, trim=True, align_arrays=True, **kwargs
+):
+    """Map a function over blocks of arrays with some overlap
 
-    We share neighboring zones between blocks of the array, then map a
-    function, then trim away the neighboring strips.
+    We share neighboring zones between blocks of the array, map a
+    function, and then trim away the neighboring strips.
+
+    Note that this function will attempt to automatically determine the output
+    array type before computing it, please refer to the ``meta`` keyword argument
+    in ``map_blocks`` if you expect that the function will not succeed when
+    operating on 0-d arrays.
 
     Parameters
     ----------
     func: function
-        The function to apply to each extended block
-    depth: int, tuple, or dict
+        The function to apply to each extended block.
+        If multiple arrays are provided, then the function should expect to
+        receive chunks of each array in the same order.
+    args : dask arrays
+    depth: int, tuple, dict or list
         The number of elements that each block should share with its neighbors
         If a tuple or dict then this can be different per axis.
+        If a list then each element of that list must be an int, tuple or dict
+        defining depth for the corresponding array in `args`.
         Asymmetric depths may be specified using a dict value of (-/+) tuples.
         Note that asymmetric depths are currently only supported when
         ``boundary`` is 'none'.
-    boundary: str, tuple, dict
+        The default value is 0.
+    boundary: str, tuple, dict or list
         How to handle the boundaries.
         Values include 'reflect', 'periodic', 'nearest', 'none',
-        or any constant value like 0 or np.nan
+        or any constant value like 0 or np.nan.
+        If a list then each element must be a str, tuple or dict defining the
+        boundary for the corresponding array in `args`.
+        The default value is 'reflect'.
     trim: bool
         Whether or not to trim ``depth`` elements from each block after
         calling the map function.
         Set this to False if your mapping function already does this for you
+    align_arrays: bool
+        Whether or not to align chunks along equally sized dimensions when
+        multiple arrays are provided.  This allows for larger chunks in some
+        arrays to be broken into smaller ones that match chunk sizes in other
+        arrays such that they are compatible for block function mapping. If
+        this is false, then an error will be thrown if arrays do not already
+        have the same number of blocks in each dimension.
     **kwargs:
         Other keyword arguments valid in ``map_blocks``
 
@@ -583,30 +611,155 @@ def map_overlap(x, func, depth, boundary=None, trim=True, **kwargs):
            [16,  17,  18,  19],
            [20,  21,  22,  23],
            [24,  25,  26,  27]])
+
+    The ``da.map_overlap`` function can also accept multiple arrays.
+
+    >>> func = lambda x, y: x + y
+    >>> x = da.arange(8).reshape(2, 4).rechunk((1, 2))
+    >>> y = da.arange(4).rechunk(2)
+    >>> da.map_overlap(func, x, y, depth=1).compute() # doctest: +NORMALIZE_WHITESPACE
+    array([[ 0,  2,  4,  6],
+           [ 4,  6,  8,  10]])
+
+    When multiple arrays are given, they do not need to have the
+    same number of dimensions but they must broadcast together.
+    Arrays are aligned block by block (just as in ``da.map_blocks``)
+    so the blocks must have a common chunk size.  This common chunking
+    is determined automatically as long as ``align_arrays`` is True.
+
+    >>> x = da.arange(8, chunks=4)
+    >>> y = da.arange(8, chunks=2)
+    >>> r = da.map_overlap(func, x, y, depth=1, align_arrays=True)
+    >>> len(r.to_delayed())
+    4
+
+    >>> da.map_overlap(func, x, y, depth=1, align_arrays=False).compute()
+    Traceback (most recent call last):
+        ...
+    ValueError: Shapes do not align {'.0': {2, 4}}
+
+    Note also that this function is equivalent to ``map_blocks``
+    by default.  A non-zero ``depth`` must be defined for any
+    overlap to appear in the arrays provided to ``func``.
+
+    >>> func = lambda x: x.sum()
+    >>> x = da.ones(10, dtype='int')
+    >>> block_args = dict(chunks=(), drop_axis=0)
+    >>> da.map_blocks(func, x, **block_args).compute()
+    10
+    >>> da.map_overlap(func, x, **block_args).compute()
+    10
+    >>> da.map_overlap(func, x, **block_args, depth=1).compute()
+    12
+
+    For functions that may not handle 0-d arrays, it's also possible to specify
+    ``meta`` with an empty array matching the type of the expected result. In
+    the example below, ``func`` will result in an ``IndexError`` when computing
+    ``meta``:
+
+    >>> x = np.arange(16).reshape((4, 4))
+    >>> d = da.from_array(x, chunks=(2, 2))
+    >>> y = d.map_overlap(lambda x: x + x[2], depth=1, meta=np.array(()))
+    >>> y
+    dask.array<_trim, shape=(4, 4), dtype=float64, chunksize=(2, 2), chunktype=numpy.ndarray>
+    >>> y.compute()
+    array([[ 4,  6,  8, 10],
+           [ 8, 10, 12, 14],
+           [20, 22, 24, 26],
+           [24, 26, 28, 30]])
+
+    Similarly, it's possible to specify a non-NumPy array to ``meta``:
+
+    >>> import cupy  # doctest: +SKIP
+    >>> x = cupy.arange(16).reshape((4, 4))  # doctest: +SKIP
+    >>> d = da.from_array(x, chunks=(2, 2))  # doctest: +SKIP
+    >>> y = d.map_overlap(lambda x: x + x[2], depth=1, meta=cupy.array(()))  # doctest: +SKIP
+    >>> y  # doctest: +SKIP
+    dask.array<_trim, shape=(4, 4), dtype=float64, chunksize=(2, 2), chunktype=cupy.ndarray>
+    >>> y.compute()  # doctest: +SKIP
+    array([[ 4,  6,  8, 10],
+           [ 8, 10, 12, 14],
+           [20, 22, 24, 26],
+           [24, 26, 28, 30]])
     """
-    depth2 = coerce_depth(x.ndim, depth)
-    boundary2 = coerce_boundary(x.ndim, boundary)
+    # Look for invocation using deprecated single-array signature
+    # map_overlap(x, func, depth, boundary=None, trim=True, **kwargs)
+    if isinstance(func, Array) and callable(args[0]):
+        warnings.warn(
+            "The use of map_overlap(array, func, **kwargs) is deprecated since dask 2.17.0 "
+            "and will be an error in a future release. To silence this warning, use the syntax "
+            "map_overlap(func, array0,[ array1, ...,] **kwargs) instead.",
+            FutureWarning,
+        )
+        sig = ["func", "depth", "boundary", "trim"]
+        depth = get(sig.index("depth"), args, depth)
+        boundary = get(sig.index("boundary"), args, boundary)
+        trim = get(sig.index("trim"), args, trim)
+        func, args = args[0], [func]
 
-    for i in range(x.ndim):
-        if isinstance(depth2[i], tuple) and boundary2[i] != "none":
-            raise NotImplementedError(
-                "Asymmetric overlap is currently only implemented "
-                "for boundary='none', however boundary for dimension "
-                "{} is {}".format(i, boundary2[i])
+    if not callable(func):
+        raise TypeError(
+            "First argument must be callable function, not {}\n"
+            "Usage:   da.map_overlap(function, x)\n"
+            "   or:   da.map_overlap(function, x, y, z)".format(type(func).__name__)
+        )
+    if not all(isinstance(x, Array) for x in args):
+        raise TypeError(
+            "All variadic arguments must be arrays, not {}\n"
+            "Usage:   da.map_overlap(function, x)\n"
+            "   or:   da.map_overlap(function, x, y, z)".format(
+                [type(x).__name__ for x in args]
             )
+        )
 
-    assert all(type(c) is int for cc in x.chunks for c in cc)
-    g = overlap(x, depth=depth2, boundary=boundary2)
-    assert all(type(c) is int for cc in g.chunks for c in cc)
-    g2 = g.map_blocks(func, **kwargs)
-    assert all(type(c) is int for cc in g2.chunks for c in cc)
+    # Coerce depth and boundary arguments to lists of individual
+    # specifications for each array argument
+    def coerce(xs, arg, fn):
+        if not isinstance(arg, list):
+            arg = [arg] * len(xs)
+        return [fn(x.ndim, a) for x, a in zip(xs, arg)]
+
+    depth = coerce(args, depth, coerce_depth)
+    boundary = coerce(args, boundary, coerce_boundary)
+
+    # Align chunks in each array to a common size
+    if align_arrays:
+        # Reverse unification order to allow block broadcasting
+        inds = [list(reversed(range(x.ndim))) for x in args]
+        _, args = unify_chunks(*list(concat(zip(args, inds))), warn=False)
+
+    for i, x in enumerate(args):
+        for j in range(x.ndim):
+            if isinstance(depth[i][j], tuple) and boundary[i][j] != "none":
+                raise NotImplementedError(
+                    "Asymmetric overlap is currently only implemented "
+                    "for boundary='none', however boundary for dimension "
+                    "{} in array argument {} is {}".format(j, i, boundary[i][j])
+                )
+
+    def assert_int_chunksize(xs):
+        assert all(type(c) is int for x in xs for cc in x.chunks for c in cc)
+
+    assert_int_chunksize(args)
+    if not trim and "chunks" not in kwargs:
+        kwargs["chunks"] = args[0].chunks
+    args = [overlap(x, depth=d, boundary=b) for x, d, b in zip(args, depth, boundary)]
+    assert_int_chunksize(args)
+    x = map_blocks(func, *args, **kwargs)
+    assert_int_chunksize([x])
     if trim:
-        return trim_internal(g2, depth2, boundary2)
+        # Find index of array argument with maximum rank and break ties by choosing first provided
+        i = sorted(enumerate(args), key=lambda v: (v[1].ndim, -v[0]))[-1][0]
+        # Trim using depth/boundary setting for array of highest rank
+        return trim_internal(x, depth[i], boundary[i])
     else:
-        return g2
+        return x
 
 
 def coerce_depth(ndim, depth):
+    default = 0
+    if depth is None:
+        depth = default
     if isinstance(depth, Integral):
         depth = (depth,) * ndim
     if isinstance(depth, tuple):

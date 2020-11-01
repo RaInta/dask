@@ -23,12 +23,12 @@ extras_require = {
         "fsspec >= 0.6.0",
     ],
     "distributed": ["distributed >= 2.0"],
-    "diagnostics": ["bokeh >= 1.0.0"],
+    "diagnostics": ["bokeh >= 1.0.0, != 2.0.0"],
     "delayed": ["cloudpickle >= 0.2.2", "toolz >= 0.8.2"],
 }
-extras_require["complete"] = sorted(
-    {"PyYaml"} | {v for req in extras_require.values() for v in req}
-)
+extras_require["complete"] = sorted({v for req in extras_require.values() for v in req})
+
+install_requires = ["pyyaml"]
 
 packages = [
     "dask",
@@ -68,7 +68,7 @@ setup(
     packages=packages + tests,
     long_description=open("README.rst").read() if exists("README.rst") else "",
     python_requires=">=3.6",
-    install_requires=[],
+    install_requires=install_requires,
     setup_requires=setup_requires,
     tests_require=["pytest"],
     extras_require=extras_require,

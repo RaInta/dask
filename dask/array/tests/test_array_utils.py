@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import dask.array as da
+from dask.array.numpy_compat import _numpy_120
 from dask.array.utils import meta_from_array, assert_eq
 
 asarrays = [np.asarray]
@@ -23,6 +24,9 @@ except ImportError:
 
 @pytest.mark.parametrize("asarray", asarrays)
 def test_meta_from_array(asarray):
+    if "COO.from_numpy" in str(asarray) and _numpy_120:
+        raise pytest.xfail(reason="sparse-383")
+
     x = np.array(1)
     assert meta_from_array(x, ndim=1).shape == (0,)
 
@@ -45,6 +49,17 @@ def test_meta_from_array(asarray):
     assert meta_from_array(np.dtype("float32")) == np.dtype("float32")
 
 
+@pytest.mark.parametrize("meta", ["", "str", u"", u"str", b"", b"str"])
+@pytest.mark.parametrize("dtype", [None, "bool", "int", "float"])
+def test_meta_from_array_literal(meta, dtype):
+    if dtype is None:
+        assert meta_from_array(meta, dtype=dtype).dtype.kind in "SU"
+    else:
+        assert (
+            meta_from_array(meta, dtype=dtype).dtype == np.array([], dtype=dtype).dtype
+        )
+
+
 def test_meta_from_array_type_inputs():
     x = meta_from_array(np.ndarray, ndim=2, dtype=np.float32)
     assert isinstance(x, np.ndarray)
@@ -57,7 +72,7 @@ def test_meta_from_array_type_inputs():
         chunks=(5, 5),
         shape=(5, 5),
         meta=np.ndarray,
-        dtype=np.float,
+        dtype=float,
     )
     assert_eq(x, x)
 

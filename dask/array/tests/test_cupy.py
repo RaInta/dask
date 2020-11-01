@@ -7,6 +7,7 @@ from dask.array.gufunc import apply_gufunc
 from dask.sizeof import sizeof
 
 cupy = pytest.importorskip("cupy")
+cupyx = pytest.importorskip("cupyx")
 
 
 functions = [
@@ -23,27 +24,36 @@ functions = [
     lambda x: x.T,
     lambda x: da.transpose(x, (1, 2, 0)),
     lambda x: x.sum(),
+    lambda x: da.empty_like(x),
+    lambda x: da.ones_like(x),
+    lambda x: da.zeros_like(x),
+    lambda x: da.full_like(x, 5),
     pytest.param(
         lambda x: x.mean(),
-        marks=pytest.mark.xfail(
-            reason="requires NumPy>=1.17 and CuPy support for shape argument in *_like functions."
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+            reason="NEP-18 support is not available in NumPy or CuPy older than "
+            "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
         ),
     ),
     pytest.param(
         lambda x: x.moment(order=0),
-        marks=pytest.mark.xfail(reason="see https://github.com/dask/dask/issues/4875"),
     ),
     lambda x: x.moment(order=2),
     pytest.param(
         lambda x: x.std(),
-        marks=pytest.mark.xfail(
-            reason="requires NumPy>=1.17 and CuPy support for shape argument in *_like functions."
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+            reason="NEP-18 support is not available in NumPy or CuPy older than "
+            "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
         ),
     ),
     pytest.param(
         lambda x: x.var(),
-        marks=pytest.mark.xfail(
-            reason="requires NumPy>=1.17 and CuPy support for shape argument in *_like functions."
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+            reason="NEP-18 support is not available in NumPy or CuPy older than "
+            "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
         ),
     ),
     pytest.param(
@@ -65,7 +75,6 @@ functions = [
     lambda x: x.map_blocks(lambda x: x * 2),
     pytest.param(
         lambda x: x.round(1),
-        marks=pytest.mark.xfail(reason="cupy doesn't support round"),
     ),
     lambda x: x.reshape((x.shape[0] * x.shape[1], x.shape[2])),
     # Rechunking here is required, see https://github.com/dask/dask/issues/2561
@@ -77,9 +86,6 @@ functions = [
     lambda x: x.rechunk((2, 2, 1)),
     pytest.param(
         lambda x: da.einsum("ijk,ijk", x, x),
-        marks=pytest.mark.xfail(
-            reason="depends on resolution of https://github.com/numpy/numpy/issues/12974"
-        ),
     ),
     lambda x: np.isneginf(x),
     lambda x: np.isposinf(x),
@@ -131,6 +137,60 @@ functions = [
             not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
         ),
     ),
+    pytest.param(
+        lambda x: np.max(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.min(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.prod(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.any(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.all(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.nansum(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.nanprod(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.nanmin(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
+    pytest.param(
+        lambda x: np.nanmax(x),
+        marks=pytest.mark.skipif(
+            not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+        ),
+    ),
 ]
 
 
@@ -145,9 +205,13 @@ def test_basic(func):
     ddn = func(dn)
 
     assert type(ddc._meta) == cupy.core.core.ndarray
-    assert_eq(ddc, ddc)  # Check that _meta and computed arrays match types
 
-    assert_eq(ddc, ddn)
+    if ddc.dask.keys()[0][0].startswith("empty"):
+        # We can't verify for data correctness when testing empty_like
+        assert type(ddc._meta) == type(ddc.compute())
+    else:
+        assert_eq(ddc, ddc)  # Check that _meta and computed arrays match types
+        assert_eq(ddc, ddn)
 
 
 @pytest.mark.parametrize("dtype", ["f4", "f8"])
@@ -215,7 +279,7 @@ def test_diagonal():
     assert_eq(da.diagonal(v, axis1=-1), np.diagonal(v, axis1=-1))
     assert_eq(da.diagonal(v, offset=1, axis1=-1), np.diagonal(v, offset=1, axis1=-1))
 
-    # Heterogenous chunks.
+    # Heterogeneous chunks.
     v = cupy.arange(2 * 3 * 4 * 5 * 6).reshape((2, 3, 4, 5, 6))
     v = da.from_array(
         v, chunks=(1, (1, 2), (1, 2, 1), (2, 1, 2), (5, 1)), asarray=False
@@ -243,12 +307,10 @@ def test_diagonal():
     assert_eq(da.diagonal(v, 1, 2, 1), np.diagonal(v, 1, 2, 1))
 
 
-@pytest.mark.xfail(reason="no shape argument support *_like functions on CuPy yet")
 @pytest.mark.skipif(
-    np.__version__ < "1.17", reason="no shape argument for *_like functions"
-)
-@pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
 )
 def test_tril_triu():
     A = cupy.random.randn(20, 20)
@@ -263,12 +325,10 @@ def test_tril_triu():
             assert_eq(da.tril(dA, k), np.tril(A, k))
 
 
-@pytest.mark.xfail(reason="no shape argument support *_like functions on CuPy yet")
 @pytest.mark.skipif(
-    np.__version__ < "1.17", reason="no shape argument for *_like functions"
-)
-@pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
 )
 def test_tril_triu_non_square_arrays():
     A = cupy.random.randint(0, 11, (30, 35))
@@ -377,12 +437,10 @@ def test_nearest():
     assert_eq(e, expected)
 
 
-@pytest.mark.xfail(reason="no shape argument support *_like functions on CuPy yet")
 @pytest.mark.skipif(
-    np.__version__ < "1.17", reason="no shape argument for *_like functions"
-)
-@pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
 )
 def test_constant():
     x = cupy.arange(64).reshape((8, 8))
@@ -396,12 +454,10 @@ def test_constant():
     assert_eq(e[-1, :], np.ones(8, dtype=x.dtype) * 10)
 
 
-@pytest.mark.xfail(reason="no shape argument support *_like functions on CuPy yet")
 @pytest.mark.skipif(
-    np.__version__ < "1.17", reason="no shape argument for *_like functions"
-)
-@pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
 )
 def test_boundaries():
     x = cupy.arange(64).reshape((8, 8))
@@ -489,11 +545,10 @@ def test_random_shapes(shape):
     assert x.shape == shape
 
 
-@pytest.mark.xfail(
-    reason="CuPy division by zero on tensordot(), https://github.com/cupy/cupy/pull/2209"
-)
 @pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.1.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.1.0 (requires https://github.com/cupy/cupy/pull/2209)",
 )
 @pytest.mark.parametrize(
     "m,n,chunks,error_type",
@@ -820,20 +875,47 @@ def test_sparse_hstack_vstack_csr():
     x = cupy.arange(24, dtype=cupy.float32).reshape(4, 6)
 
     sp = da.from_array(x, chunks=(2, 3), asarray=False, fancy=False)
-    sp = sp.map_blocks(cupy.sparse.csr_matrix, dtype=cupy.float32)
+    sp = sp.map_blocks(cupyx.scipy.sparse.csr_matrix, dtype=cupy.float32)
 
     y = sp.compute()
 
-    assert cupy.sparse.isspmatrix(y)
+    assert cupyx.scipy.sparse.isspmatrix(y)
     assert_eq(x, y.todense())
 
 
-@pytest.mark.xfail(reason="no shape argument support *_like functions on CuPy yet")
+@pytest.mark.parametrize("axis", [0, 1])
+def test_cupy_sparse_concatenate(axis):
+    pytest.importorskip("cupyx")
+
+    rs = da.random.RandomState(RandomState=cupy.random.RandomState)
+    meta = cupyx.scipy.sparse.csr_matrix((0, 0))
+
+    xs = []
+    ys = []
+    for i in range(2):
+        x = rs.random((1000, 10), chunks=(100, 10))
+        x[x < 0.9] = 0
+        xs.append(x)
+        ys.append(x.map_blocks(cupyx.scipy.sparse.csr_matrix, meta=meta))
+
+    z = da.concatenate(ys, axis=axis)
+    z = z.compute()
+
+    if axis == 0:
+        sp_concatenate = cupyx.scipy.sparse.vstack
+    elif axis == 1:
+        sp_concatenate = cupyx.scipy.sparse.hstack
+    z_expected = sp_concatenate(
+        [cupyx.scipy.sparse.csr_matrix(e.compute()) for e in xs]
+    )
+
+    assert (z.toarray() == z_expected.toarray()).all()
+
+
 @pytest.mark.skipif(
-    np.__version__ < "1.17", reason="no shape argument for *_like functions"
-)
-@pytest.mark.skipif(
-    not IS_NEP18_ACTIVE, reason="NEP-18 support is not available in NumPy"
+    not IS_NEP18_ACTIVE or cupy.__version__ < "6.4.0",
+    reason="NEP-18 support is not available in NumPy or CuPy older than "
+    "6.4.0 (requires https://github.com/cupy/cupy/pull/2418)",
 )
 def test_bincount():
     x = cupy.array([2, 1, 5, 2, 1])

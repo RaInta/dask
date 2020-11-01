@@ -1,5 +1,6 @@
 import copyreg
 import multiprocessing
+import os
 import pickle
 import sys
 import traceback
@@ -27,9 +28,9 @@ try:
     _loads = cloudpickle.loads
 except ImportError:
 
-    def _dumps(obj):
+    def _dumps(obj, **kwargs):
         try:
-            return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL, **kwargs)
         except (pickle.PicklingError, AttributeError) as exc:
             raise ModuleNotFoundError(
                 "Please install cloudpickle to use the multiprocessing scheduler"
@@ -56,7 +57,7 @@ def _process_get_id():
 # To enable testing of the ``RemoteException`` class even when tblib is
 # installed, we don't wrap the class in the try block below
 class RemoteException(Exception):
-    """ Remote Exception
+    """Remote Exception
 
     Contains the exception and traceback from a remotely run task
     """
@@ -160,7 +161,7 @@ def get(
     pool=None,
     **kwargs
 ):
-    """ Multiprocessed get function appropriate for Bags
+    """Multiprocessed get function appropriate for Bags
 
     Parameters
     ----------
@@ -182,6 +183,15 @@ def get(
     pool = pool or config.get("pool", None)
     num_workers = num_workers or config.get("num_workers", None) or CPU_COUNT
     if pool is None:
+        # In order to get consistent hashing in subprocesses, we need to set a
+        # consistent seed for the Python hash algorithm. Unfortunatley, there
+        # is no way to specify environment variables only for the Pool
+        # processes, so we have to rely on environment variables being
+        # inherited.
+        if os.environ.get("PYTHONHASHSEED") in (None, "0"):
+            # This number is arbitrary; it was chosen to commemorate
+            # https://github.com/dask/dask/issues/6640.
+            os.environ["PYTHONHASHSEED"] = "6640"
         context = get_context()
         pool = context.Pool(num_workers, initializer=initialize_worker_process)
         cleanup = True

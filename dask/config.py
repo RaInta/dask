@@ -6,10 +6,7 @@ import sys
 import threading
 import warnings
 
-try:
-    import yaml
-except ImportError:
-    yaml = None
+import yaml
 
 
 no_default = "__no_default__"
@@ -62,7 +59,7 @@ def canonical_name(k, config):
 
 
 def update(old, new, priority="new"):
-    """ Update a nested dictionary with values from another
+    """Update a nested dictionary with values from another
 
     This is like dict.update except that it smoothly merges nested values
 
@@ -105,7 +102,7 @@ def update(old, new, priority="new"):
 
 
 def merge(*dicts):
-    """ Update a sequence of nested dictionaries
+    """Update a sequence of nested dictionaries
 
     This prefers the values in the latter dictionaries to those in the former
 
@@ -127,7 +124,7 @@ def merge(*dicts):
 
 
 def collect_yaml(paths=paths):
-    """ Collect configuration from yaml files
+    """Collect configuration from yaml files
 
     This searches through a list of paths, expands to find all yaml or json
     files, and then parses each file.
@@ -170,7 +167,7 @@ def collect_yaml(paths=paths):
 
 
 def collect_env(env=None):
-    """ Collect config from environment variables
+    """Collect config from environment variables
 
     This grabs environment variables of the form "DASK_FOO__BAR_BAZ=123" and
     turns these into config variables of the form ``{"foo": {"bar-baz": 123}}``
@@ -259,7 +256,7 @@ def ensure_file(source, destination=None, comment=True):
 
 
 class set(object):
-    """ Temporarily set configuration values within a context manager
+    """Temporarily set configuration values within a context manager
 
     Parameters
     ----------
@@ -387,11 +384,8 @@ def collect(paths=paths, env=None):
     """
     if env is None:
         env = os.environ
-    configs = []
 
-    if yaml:
-        configs.extend(collect_yaml(paths=paths))
-
+    configs = collect_yaml(paths=paths)
     configs.append(collect_env(env=env))
 
     return merge(*configs)
@@ -466,7 +460,7 @@ def get(key, default=no_default, config=config):
 
 
 def rename(aliases, config=config):
-    """ Rename old keys to new keys
+    """Rename old keys to new keys
 
     This helps migrate older configuration versions over time
     """
@@ -485,7 +479,7 @@ def rename(aliases, config=config):
 
 
 def update_defaults(new, config=config, defaults=defaults):
-    """ Add a new set of defaults to the configuration
+    """Add a new set of defaults to the configuration
 
     It does two things:
 
@@ -498,7 +492,7 @@ def update_defaults(new, config=config, defaults=defaults):
 
 
 def expand_environment_variables(config):
-    """ Expand environment variables in a nested config dictionary
+    """Expand environment variables in a nested config dictionary
 
     This function will recursively search through any nested dictionaries
     and/or lists.
@@ -538,7 +532,7 @@ deprecations = {
 
 
 def check_deprecations(key: str, deprecations: dict = deprecations):
-    """ Check if the provided value has been renamed or removed
+    """Check if the provided value has been renamed or removed
 
     Parameters
     ----------
@@ -581,15 +575,14 @@ def check_deprecations(key: str, deprecations: dict = deprecations):
         return key
 
 
-refresh()
-
-
-if yaml:
+def _initialize():
     fn = os.path.join(os.path.dirname(__file__), "dask.yaml")
-    ensure_file(source=fn)
 
     with open(fn) as f:
         _defaults = yaml.safe_load(f)
 
     update_defaults(_defaults)
-    del fn, _defaults
+
+
+refresh()
+_initialize()

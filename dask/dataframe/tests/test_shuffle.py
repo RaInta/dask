@@ -17,6 +17,7 @@ import dask.dataframe as dd
 from dask.dataframe._compat import tm, assert_categorical_equal
 from dask import delayed
 from dask.base import compute_as_if_collection
+from dask.optimization import cull
 from dask.dataframe.shuffle import (
     shuffle,
     partitioning_index,
@@ -27,7 +28,6 @@ from dask.dataframe.shuffle import (
 )
 from dask.dataframe.utils import assert_eq, make_meta
 
-
 dsk = {
     ("x", 0): pd.DataFrame({"a": [1, 2, 3], "b": [1, 4, 7]}, index=[0, 1, 3]),
     ("x", 1): pd.DataFrame({"a": [4, 5, 6], "b": [2, 5, 8]}, index=[5, 6, 8]),
@@ -36,6 +36,9 @@ dsk = {
 meta = make_meta({"a": "i8", "b": "i8"}, index=pd.Index([], "i8"))
 d = dd.DataFrame(dsk, "x", meta, [0, 4, 9, 9])
 full = d.compute()
+CHECK_FREQ = {}
+if dd._compat.PANDAS_GT_110:
+    CHECK_FREQ["check_freq"] = False
 
 
 shuffle_func = shuffle  # conflicts with keyword argument
@@ -718,9 +721,6 @@ def test_set_index_sorted_true():
     with pytest.raises(ValueError):
         a.set_index(a.z, sorted=True)
 
-    with pytest.warns(UserWarning):
-        a.set_index(a.y, sorted=True)
-
 
 def test_set_index_sorted_single_partition():
     df = pd.DataFrame({"x": [1, 2, 3, 4], "y": [1, 0, 1, 0]})
@@ -775,7 +775,7 @@ def test_set_index_on_empty():
         ddf = ddf[ddf.y > df.y.max()].set_index("x")
         expected_df = df[df.y > df.y.max()].set_index("x")
 
-        assert assert_eq(ddf, expected_df)
+        assert assert_eq(ddf, expected_df, **CHECK_FREQ)
         assert ddf.npartitions == 1
 
 
@@ -796,7 +796,7 @@ def test_set_index_categorical():
 
 
 def test_compute_divisions():
-    from dask.dataframe.shuffle import compute_divisions
+    from dask.dataframe.shuffle import compute_and_set_divisions
 
     df = pd.DataFrame(
         {"x": [1, 2, 3, 4], "y": [10, 20, 20, 40], "z": [4, 3, 2, 1]},
@@ -805,17 +805,10 @@ def test_compute_divisions():
     a = dd.from_pandas(df, 2, sort=False)
     assert not a.known_divisions
 
-    divisions = compute_divisions(a)
-    b = copy(a)
-    b.divisions = divisions
+    b = compute_and_set_divisions(copy(a))
 
     assert_eq(a, b, check_divisions=False)
     assert b.known_divisions
-
-    c = dd.from_pandas(df.set_index("y"), 2, sort=False)
-    # Partitions overlap warning
-    with pytest.warns(UserWarning):
-        compute_divisions(c)
 
 
 def test_empty_partitions():
@@ -926,8 +919,8 @@ def test_set_index_timestamp():
         assert ts1.value == ts2.value
         assert ts1.tz == ts2.tz
 
-    assert_eq(df2, ddf_new_div)
-    assert_eq(df2, ddf.set_index("A"))
+    assert_eq(df2, ddf_new_div, **CHECK_FREQ)
+    assert_eq(df2, ddf.set_index("A"), **CHECK_FREQ)
 
 
 @pytest.mark.parametrize("compression", [None, "ZLib"])
@@ -973,3 +966,110 @@ def test_disk_shuffle_check_actual_compression():
     compressed_data = generate_raw_partd_file(compression="BZ2")
 
     assert len(uncompressed_data) > len(compressed_data)
+
+
+@pytest.mark.parametrize("ignore_index", [None, True, False])
+@pytest.mark.parametrize(
+    "on", ["id", "name", ["id", "name"], pd.Series(["id", "name"])]
+)
+@pytest.mark.parametrize("max_branch", [None, 4])
+def test_dataframe_shuffle_on_tasks_api(on, ignore_index, max_branch):
+    # Make sure DataFrame.shuffle API returns the same result
+    # whether the ``on`` argument is a list of column names,
+    # or a separate DataFrame with equivalent values...
+    df_in = dask.datasets.timeseries(
+        "2000",
+        "2001",
+        types={"value": float, "name": str, "id": int},
+        freq="2H",
+        partition_freq="1M",
+        seed=1,
+    )
+    if isinstance(on, str):
+        ext_on = df_in[[on]].copy()
+    else:
+        ext_on = df_in[on].copy()
+    df_out_1 = df_in.shuffle(
+        on, shuffle="tasks", ignore_index=ignore_index, max_branch=max_branch
+    )
+    df_out_2 = df_in.shuffle(ext_on, shuffle="tasks", ignore_index=ignore_index)
+
+    assert_eq(df_out_1, df_out_2, check_index=(not ignore_index))
+
+    if ignore_index:
+        assert df_out_1.index.dtype != df_in.index.dtype
+    else:
+        assert df_out_1.index.dtype == df_in.index.dtype
+
+
+def test_set_index_overlap():
+    A = pd.DataFrame({"key": [1, 2, 3, 4, 4, 5, 6, 7], "value": list("abcd" * 2)})
+    a = dd.from_pandas(A, npartitions=2)
+    a = a.set_index("key", sorted=True)
+    b = a.repartition(divisions=a.divisions)
+    assert_eq(a, b)
+
+
+def test_shuffle_hlg_layer():
+    # This test checks that the `ShuffleLayer` HLG Layer
+    # is used (as expected) for a multi-stage shuffle.
+    ddf = dd.from_pandas(
+        pd.DataFrame({"a": np.random.randint(0, 10, 100)}), npartitions=10
+    )
+    ddf_shuffled = ddf.shuffle("a", max_branch=3, shuffle="tasks")
+    keys = [(ddf_shuffled._name, i) for i in range(ddf_shuffled.npartitions)]
+
+    # Cull the HLG
+    dsk = ddf_shuffled.__dask_graph__()
+    dsk_culled = dsk.cull(set(keys))
+    assert isinstance(dsk_culled, dask.highlevelgraph.HighLevelGraph)
+
+    # Ensure we have ShuffleLayers
+    assert any(
+        isinstance(layer, dd.shuffle.ShuffleLayer) for layer in dsk.layers.values()
+    )
+
+    # Check that the ShuffleLayers are non-materialized
+    for layer in dsk.layers.values():
+        if isinstance(layer, dd.shuffle.ShuffleLayer):
+            assert not hasattr(layer, "_cached_dict")
+
+    # Make sure HLG culling reduces the graph size
+    assert len(dsk_culled) < len(dsk)
+
+    # Check ShuffleLayer names
+    for name, layer in dsk.layers.items():
+        if isinstance(layer, dd.shuffle.ShuffleLayer):
+            assert name.startswith("shuffle-")
+
+    # Since we already culled the HLG,
+    # culling the dictionary should not change the graph
+    dsk_dict = dict(dsk_culled)
+    dsk_dict_culled, _ = cull(dsk_dict, keys)
+    assert dsk_dict_culled == dsk_dict
+
+
+@pytest.mark.parametrize(
+    "npartitions",
+    [
+        10,  # ShuffleLayer
+        1,  # SimpleShuffleLayer
+    ],
+)
+def test_shuffle_hlg_layer_serialize(npartitions):
+    ddf = dd.from_pandas(
+        pd.DataFrame({"a": np.random.randint(0, 10, 100)}), npartitions=npartitions
+    )
+    ddf_shuffled = ddf.shuffle("a", max_branch=3, shuffle="tasks")
+
+    # Ensure shuffle layers can be serialized and don't result in
+    # the underlying low-level graph being materialized
+    dsk = ddf_shuffled.__dask_graph__()
+    for layer in dsk.layers.values():
+        if not isinstance(layer, dd.shuffle.SimpleShuffleLayer):
+            continue
+        assert not hasattr(layer, "_cached_dict")
+        layer_roundtrip = pickle.loads(pickle.dumps(layer))
+        assert type(layer_roundtrip) == type(layer)
+        assert not hasattr(layer_roundtrip, "_cached_dict")
+        assert layer_roundtrip.keys() == layer.keys()

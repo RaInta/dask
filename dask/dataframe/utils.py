@@ -25,6 +25,7 @@ from ._compat import (  # noqa: F401
     PANDAS_GT_0240,
     PANDAS_GT_0250,
     PANDAS_GT_100,
+    PANDAS_GT_110,
     HAS_INT_NA,
     tm,
 )
@@ -40,6 +41,7 @@ from ..utils import is_index_like as dask_is_index_like
 
 # register pandas extension types
 from . import _dtypes  # noqa: F401
+from . import methods
 
 
 def is_integer_na_dtype(t):
@@ -61,7 +63,7 @@ def is_integer_na_dtype(t):
 
 
 def shard_df_on_index(df, divisions):
-    """ Shard a DataFrame by ranges on its index
+    """Shard a DataFrame by ranges on its index
 
     Examples
     --------
@@ -190,7 +192,7 @@ def raise_on_meta_error(funcname=None, udf=False):
             "{2}"
         )
         msg = msg.format(" in `{0}`".format(funcname) if funcname else "", repr(e), tb)
-        raise ValueError(msg)
+        raise ValueError(msg) from e
 
 
 UNKNOWN_CATEGORIES = "__UNKNOWN_CATEGORIES__"
@@ -312,13 +314,14 @@ def make_meta_object(x, index=None):
 
     Examples
     --------
-    >>> make_meta([('a', 'i8'), ('b', 'O')])
+
+    >>> make_meta([('a', 'i8'), ('b', 'O')])    # doctest: +SKIP
     Empty DataFrame
     Columns: [a, b]
     Index: []
-    >>> make_meta(('a', 'f8'))
+    >>> make_meta(('a', 'f8'))                  # doctest: +SKIP
     Series([], Name: a, dtype: float64)
-    >>> make_meta('i8')
+    >>> make_meta('i8')                         # doctest: +SKIP
     1
     """
     if hasattr(x, "_meta"):
@@ -396,6 +399,8 @@ def meta_nonempty_dataframe(x):
         data[i] = dt_s_dict[dt]
     res = pd.DataFrame(data, index=idx, columns=np.arange(len(x.columns)))
     res.columns = x.columns
+    if PANDAS_GT_100:
+        res.attrs = x.attrs
     return res
 
 
@@ -483,7 +488,10 @@ def group_split_pandas(df, c, k, ignore_index=False):
     )
     df2 = df.take(indexer)
     locations = locations.cumsum()
-    parts = [df2.iloc[a:b] for a, b in zip(locations[:-1], locations[1:])]
+    parts = [
+        df2.iloc[a:b].reset_index(drop=True) if ignore_index else df2.iloc[a:b]
+        for a, b in zip(locations[:-1], locations[1:])
+    ]
     return dict(zip(range(k), parts))
 
 
@@ -550,7 +558,7 @@ def _nonempty_series(s, idx=None):
             cats = s.cat.categories
         else:
             data = _nonempty_index(s.cat.categories)
-            cats = None
+            cats = s.cat.categories[:0]
         data = pd.Categorical(data, categories=cats, ordered=s.cat.ordered)
     elif is_integer_na_dtype(dtype):
         data = pd.array([1, None], dtype=dtype)
@@ -565,7 +573,10 @@ def _nonempty_series(s, idx=None):
             entry = _scalar_from_dtype(dtype.subtype)
         else:
             entry = _scalar_from_dtype(dtype.subtype)
-        data = pd.SparseArray([entry, entry], dtype=dtype)
+        if PANDAS_GT_100:
+            data = pd.array([entry, entry], dtype=dtype)
+        else:
+            data = pd.SparseArray([entry, entry], dtype=dtype)
     elif is_interval_dtype(dtype):
         entry = _scalar_from_dtype(dtype.subtype)
         if PANDAS_GT_0240:
@@ -578,7 +589,10 @@ def _nonempty_series(s, idx=None):
         entry = _scalar_from_dtype(dtype)
         data = np.array([entry, entry], dtype=dtype)
 
-    return pd.Series(data, name=s.name, index=idx)
+    out = pd.Series(data, name=s.name, index=idx)
+    if PANDAS_GT_100:
+        out.attrs = s.attrs
+    return out
 
 
 def is_dataframe_like(df):
@@ -642,7 +656,7 @@ def check_meta(x, meta, funcname=None, numeric_equal=True):
     elif is_dataframe_like(meta):
         dtypes = pd.concat([x.dtypes, meta.dtypes], axis=1, sort=True)
         bad_dtypes = [
-            (col, a, b)
+            (repr(col), a, b)
             for col, a, b in dtypes.fillna("-").itertuples()
             if not equal_dtypes(a, b)
         ]
@@ -671,8 +685,8 @@ def check_meta(x, meta, funcname=None, numeric_equal=True):
 def check_matching_columns(meta, actual):
     # Need nan_to_num otherwise nan comparison gives False
     if not np.array_equal(np.nan_to_num(meta.columns), np.nan_to_num(actual.columns)):
-        extra = actual.columns.difference(meta.columns).tolist()
-        missing = meta.columns.difference(actual.columns).tolist()
+        extra = methods.tolist(actual.columns.difference(meta.columns))
+        missing = methods.tolist(meta.columns.difference(actual.columns))
         if extra or missing:
             extra_info = f"  Extra:   {extra}\n  Missing: {missing}"
         else:
@@ -685,8 +699,7 @@ def check_matching_columns(meta, actual):
 
 
 def index_summary(idx, name=None):
-    """Summarized representation of an Index.
-    """
+    """Summarized representation of an Index."""
     n = len(idx)
     if name is None:
         name = idx.__class__.__name__
@@ -708,7 +721,10 @@ def index_summary(idx, name=None):
 def _check_dask(dsk, check_names=True, check_dtypes=True, result=None):
     import dask.dataframe as dd
 
-    if hasattr(dsk, "dask"):
+    if hasattr(dsk, "__dask_graph__"):
+        graph = dsk.__dask_graph__()
+        if hasattr(graph, "validate"):
+            graph.validate()
         if result is None:
             result = dsk.compute(scheduler="sync")
         if isinstance(dsk, dd.Index):
@@ -771,7 +787,7 @@ def _maybe_sort(a):
                 a.index.names = [
                     "-overlapped-index-name-%d" % i for i in range(len(a.index.names))
                 ]
-            a = a.sort_values(by=a.columns.tolist())
+            a = a.sort_values(by=methods.tolist(a.columns))
         else:
             a = a.sort_values()
     except (TypeError, IndexError, ValueError):
@@ -923,7 +939,7 @@ def assert_max_deps(x, n, eq=True):
 
 
 def valid_divisions(divisions):
-    """ Are the provided divisions valid?
+    """Are the provided divisions valid?
 
     Examples
     --------
@@ -960,8 +976,7 @@ def valid_divisions(divisions):
 
 
 def drop_by_shallow_copy(df, columns, errors="raise"):
-    """ Use shallow copy to drop columns in place
-    """
+    """Use shallow copy to drop columns in place"""
     df2 = df.copy(deep=False)
     if not pd.api.types.is_list_like(columns):
         columns = [columns]
